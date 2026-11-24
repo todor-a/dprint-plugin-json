@@ -4,7 +4,7 @@
 
 use dprint_core::configuration::NewLineKind;
 
-use crate::configuration::{Configuration, TrailingCommaKind};
+use crate::configuration::{Configuration, EofNewLineKind, TrailingCommaKind};
 use super::{Kind, Token, is_close, is_comment, is_open};
 
 /// Previous emitted token kind, for picking single-line separators.
@@ -46,6 +46,7 @@ struct Printer<'a> {
   object_prefer_single_line: bool,
   space_surrounding_properties: bool,
   newline: &'static [u8],
+  eof_new_line: bool,
 }
 
 impl<'a> Printer<'a> {
@@ -84,26 +85,51 @@ impl<'a> Printer<'a> {
   }
 
   // ---- string / key / comment rendering ----
+  /// Writes a string in double quotes with the same value. Control characters (U+0000 through
+  /// U+001F), which JSON doesn't allow unescaped in strings, get escaped. That includes a control
+  /// character escaped the JSON5 way (ex. a backslash then a tab), and a JSON5 line continuation
+  /// (a backslash then a newline) is removed since it means nothing. Works on bytes, so text that
+  /// isn't valid UTF-8 passes through.
   fn render_string(&self, t: &Token, buf: &mut Vec<u8>) {
     let raw = &self.src[t.start..t.end];
-    let quote = raw[0];
+    let is_single_quoted = raw[0] == b'\'';
     let inner = &raw[1..raw.len() - 1];
     buf.push(b'"');
-    if quote == b'"' {
+    let needs_change = |b: &u8| *b < 0x20 || is_single_quoted && matches!(b, b'"' | b'\'');
+    if !inner.iter().any(needs_change) {
       buf.extend_from_slice(inner);
     } else {
       let mut k = 0;
       while k < inner.len() {
-        if inner[k] == b'\\' && k + 1 < inner.len() && inner[k + 1] == b'\'' {
-          buf.push(b'\'');
-          k += 2;
-        } else if inner[k] == b'"' {
-          buf.push(b'\\');
-          buf.push(b'"');
-          k += 1;
-        } else {
-          buf.push(inner[k]);
-          k += 1;
+        let c = inner[k];
+        k += 1;
+        match c {
+          b'\\' => match inner.get(k) {
+            Some(b'\n') => k += 1,
+            Some(b'\r') => {
+              k += 1;
+              if inner.get(k) == Some(&b'\n') {
+                k += 1;
+              }
+            }
+            Some(&c) if c < 0x20 => {
+              push_escaped_control_char(buf, c);
+              k += 1;
+            }
+            Some(b'\'') if is_single_quoted => {
+              buf.push(b'\'');
+              k += 1;
+            }
+            Some(&c) => {
+              buf.push(b'\\');
+              buf.push(c);
+              k += 1;
+            }
+            None => buf.push(b'\\'),
+          },
+          b'"' if is_single_quoted => buf.extend_from_slice(b"\\\""),
+          c if c < 0x20 => push_escaped_control_char(buf, c),
+          c => buf.push(c),
         }
       }
     }
@@ -678,7 +704,12 @@ impl<'a> Printer<'a> {
       k += 1;
     }
     let is_last = is_close(self.toks[k].kind);
-    let emit_comma = if is_last { self.trailing_comma_for_last(src_comma) } else { true };
+    let emit_comma = match is_last {
+      false => true,
+      // an ignore comment also applies to the node's trailing comma
+      true if pending_ignore => src_comma,
+      true => self.trailing_comma_for_last(src_comma),
+    };
     let trailing = if emit_comma { 1 } else { 0 };
 
     if pending_ignore {
@@ -706,7 +737,8 @@ impl<'a> Printer<'a> {
         g += 1;
       }
       if emit_comma {
-        if self.toks[comma_idx].nl_before == 0 {
+        // a comma only stays on its own line below a comment
+        if self.toks[comma_idx].nl_before == 0 || comma_idx == value_end {
           self.emit(b",");
         } else {
           self.nl();
@@ -798,7 +830,7 @@ impl<'a> Printer<'a> {
 
     debug_assert_eq!(idx, len, "validate() should have rejected leftover tokens");
     // final newline
-    if !self.out.is_empty() && self.out.last() != Some(&b'\n') {
+    if self.eof_new_line && !self.out.is_empty() && self.out.last() != Some(&b'\n') {
       self.nl();
     }
   }
@@ -846,6 +878,29 @@ fn resolve_newline(src: &[u8], kind: NewLineKind) -> &'static [u8] {
   }
 }
 
+fn should_end_with_new_line(src: &[u8], kind: EofNewLineKind) -> bool {
+  match kind {
+    EofNewLineKind::Always => true,
+    EofNewLineKind::Never => false,
+    // look for a newline anywhere in the trailing whitespace so that ex. a space after it doesn't count
+    // against it, and include `\r` for files that use it on its own as the newline
+    EofNewLineKind::Maintain => src[src.trim_ascii_end().len()..]
+      .iter()
+      .any(|&b| matches!(b, b'\n' | b'\r')),
+  }
+}
+
+fn push_escaped_control_char(buf: &mut Vec<u8>, c: u8) {
+  match c {
+    b'\n' => buf.extend_from_slice(b"\\n"),
+    b'\r' => buf.extend_from_slice(b"\\r"),
+    b'\t' => buf.extend_from_slice(b"\\t"),
+    0x08 => buf.extend_from_slice(b"\\b"),
+    0x0C => buf.extend_from_slice(b"\\f"),
+    _ => buf.extend_from_slice(format!("\\u{:04x}", c).as_bytes()),
+  }
+}
+
 /// Format JSON/JSONC bytes directly, no parser. Validates the grammar itself
 /// and returns `Err` with a byte range + message on a syntax error. Works on
 
@@ -868,6 +923,7 @@ pub(super) fn format(src: &[u8], toks: &[Token], config: &Configuration, is_json
     object_prefer_single_line: config.object_prefer_single_line,
     space_surrounding_properties: config.space_surrounding_properties,
     newline: resolve_newline(src, config.new_line_kind),
+    eof_new_line: should_end_with_new_line(src, config.eof_new_line),
   };
   p.emit_root();
   p.out

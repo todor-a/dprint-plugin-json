@@ -21,15 +21,28 @@ pub fn is_package_json_file(path: &Path) -> bool {
 ///
 /// The top level is written in the conventional field order, which is the one used by
 /// [`sort-package-json`](https://github.com/keithamus/sort-package-json), and the maps whose keys
-/// are package names or similar are written alphabetically, one level deep. A dependency section
-/// written in runs with a comment heading each is alphabetized a run at a time, with each heading
-/// left over its run. Everything else is left alone: the order of `exports` conditions and of
-/// `files`, `workspaces` or `scripts` entries is the author's to decide, and so is the order of
+/// are package names or similar are written alphabetically, one level deep. A key starting with
+/// `//`, which stands in for a comment, stays above the field it was written over. A dependency
+/// section written in runs with a comment heading each is alphabetized a run at a time, with each
+/// heading left over its run. Everything else is left alone: the order of `exports` conditions and
+/// of `files`, `workspaces` or `scripts` entries is the author's to decide, and so is the order of
 /// anything a package manager reads as a list of rules rather than as a map.
 ///
 /// The work happens on the CST so that what was written with a property travels with it. Text that
 /// doesn't parse is handed back untouched, since the formatter is about to report that itself.
 pub fn apply_conventions<'a>(text: &'a str, config: &Configuration) -> Cow<'a, str> {
+  apply_conventions_within(text, config, None)
+}
+
+/// Rewrites only the sections that are the values of the top level properties at the provided
+/// indexes, leaving the order of the top level and of every other section as it was written.
+///
+/// This is what formatting a range uses so that nothing outside of the range moves.
+pub fn apply_conventions_to_sections<'a>(text: &'a str, config: &Configuration, sections: &[usize]) -> Cow<'a, str> {
+  apply_conventions_within(text, config, Some(sections))
+}
+
+fn apply_conventions_within<'a>(text: &'a str, config: &Configuration, sections: Option<&[usize]>) -> Cow<'a, str> {
   let Ok(root) = CstRootNode::parse(text, &ParseOptions::default()) else {
     return Cow::Borrowed(text);
   };
@@ -40,8 +53,15 @@ pub fn apply_conventions<'a>(text: &'a str, config: &Configuration) -> Cow<'a, s
   // A comment written above a top level property travels with it. A conventional order rearranges
   // the whole file, so a comment left behind would end up over a property it says nothing about,
   // and one written above `dependencies` is almost always about those.
-  root_object.sort_properties().by(compare_top_level_fields);
-  for prop in root_object.properties() {
+  if sections.is_none() {
+    sort_fields(&root_object, None, top_level_field_key);
+  }
+  for (index, prop) in root_object.properties().into_iter().enumerate() {
+    // the top level is only left in the order it was written when given the sections, so the
+    // indexes are still the ones the caller knows
+    if sections.is_some_and(|sections| !sections.contains(&index)) {
+      continue;
+    }
     let Some(section) = alphabetical_section(&decoded_name(&prop)) else {
       continue;
     };
@@ -49,7 +69,7 @@ pub fn apply_conventions<'a>(text: &'a str, config: &Configuration) -> Cow<'a, s
       continue;
     };
     match section {
-      Section::Plain => object.sort_properties().by(compare_properties),
+      Section::Plain => sort_fields(&object, None, NpmName::of),
       Section::Dependencies => sort_dependencies(&object, config),
       Section::Overrides if !names_a_package_twice(&object) => sort_dependencies(&object, config),
       Section::Overrides => {}
@@ -83,7 +103,7 @@ pub fn apply_conventions<'a>(text: &'a str, config: &Configuration) -> Cow<'a, s
 /// as a whole.
 fn sort_dependencies(section: &CstObject, config: &Configuration) {
   if config.object_prefer_single_line || !opens_on_its_own_line(section) {
-    section.sort_properties().by(compare_properties);
+    sort_fields(section, None, NpmName::of);
     return;
   }
 
@@ -98,12 +118,52 @@ fn sort_dependencies(section: &CstObject, config: &Configuration) {
       (prop.child_index(), run)
     })
     .collect::<HashMap<_, _>>();
-  section.sort_properties().pin_comment_headers().by(|left, right| {
-    runs
-      .get(&left.child_index())
-      .cmp(&runs.get(&right.child_index()))
-      .then_with(|| compare_properties(left, right))
+  sort_fields(section, Some(runs), NpmName::of);
+}
+
+/// Sorts an object's fields by a key, with each comment key kept above the field it was written
+/// over.
+///
+/// `package.json` has no comments, so a key starting with `//` is commonly written above a field to
+/// say something about it. Such a key is not a field of its own: it travels with the field written
+/// below it, the same way a comment does, and one with no field below it stays at the end.
+///
+/// Given the run each property was written in, by child index, the fields are sorted a run at a
+/// time with each run's heading left over it. A comment key is then only about a field in its own
+/// run, and one with no such field below it stays at the end of its run rather than follow a field
+/// under the next heading.
+fn sort_fields<K: Ord>(object: &CstObject, runs: Option<HashMap<usize, usize>>, key: impl Fn(&CstObjectProp) -> K) {
+  let run = |prop: &CstObjectProp| runs.as_ref().map_or(0, |runs| runs[&prop.child_index()]);
+
+  // walking upwards so that each comment key finds the field below it
+  let mut field: Option<CstObjectProp> = None;
+  let mut fields = HashMap::new();
+  for prop in object.properties().into_iter().rev() {
+    let index = prop.child_index();
+    if !is_comment_key(&decoded_name(&prop)) {
+      field = Some(prop);
+    } else if field.as_ref().is_some_and(|field| run(field) != run(&prop)) {
+      field = None;
+    }
+    fields.insert(index, field.clone());
+  }
+
+  let mut sort = object.sort_properties();
+  if runs.is_some() {
+    sort = sort.pin_comment_headers();
+  }
+  sort.by_key(|prop| {
+    // the index keeps a field's comment keys above it, in the order they were written
+    let index = prop.child_index();
+    let field = fields[&index].as_ref().map(&key);
+    (run(prop), field.is_none(), field, index)
   });
+}
+
+/// Whether a key is the `package.json` stand-in for a comment (`"//"`, `"// node"`, ...), which npm
+/// reserves for that.
+fn is_comment_key(name: &str) -> bool {
+  name.starts_with("//")
 }
 
 /// Whether the section's first property is written on a line after its open brace, which is what
@@ -137,7 +197,10 @@ fn names_a_package_twice(overrides: &CstObject) -> bool {
   overrides
     .properties()
     .iter()
-    .any(|prop| !seen.insert(package_name(&decoded_name(prop)).to_string()))
+    .map(decoded_name)
+    // a comment key names no package, however many times it is written
+    .filter(|name| !is_comment_key(name))
+    .any(|name| !seen.insert(package_name(&name).to_string()))
 }
 
 /// The package a key names without any version written after it, so that `foo@^2` is `foo` and
@@ -151,24 +214,35 @@ fn package_name(key: &str) -> &str {
   }
 }
 
-fn compare_top_level_fields(left: &CstObjectProp, right: &CstObjectProp) -> Ordering {
-  let left = decoded_name(left);
-  let right = decoded_name(right);
-  match (field_index(&left), field_index(&right)) {
-    (Some(left), Some(right)) => left.cmp(&right),
-    (Some(_), None) => Ordering::Less,
-    (None, Some(_)) => Ordering::Greater,
-    // a field the conventions don't know goes below the ones they do, in alphabetical order, with
-    // the underscore prefixed fields npm adds to an installed package (`_id`, `_resolved`, ...) last
-    (None, None) => left
-      .starts_with('_')
-      .cmp(&right.starts_with('_'))
-      .then_with(|| compare_names(&left, &right)),
+/// The key that sorts a top level field into place: the fields the conventions know come first, in
+/// their order, and a field they don't know goes below them, in alphabetical order, with the
+/// underscore prefixed fields npm adds to an installed package (`_id`, `_resolved`, ...) last.
+fn top_level_field_key(prop: &CstObjectProp) -> (usize, bool, NpmName) {
+  let name = decoded_name(prop);
+  let index = field_index(&name).unwrap_or(FIELD_ORDER.len());
+  (index, name.starts_with('_'), NpmName(name))
+}
+
+/// A property name that orders the way npm orders names, as described on [`compare_names`].
+#[derive(PartialEq, Eq)]
+struct NpmName(String);
+
+impl NpmName {
+  fn of(prop: &CstObjectProp) -> Self {
+    NpmName(decoded_name(prop))
   }
 }
 
-fn compare_properties(left: &CstObjectProp, right: &CstObjectProp) -> Ordering {
-  compare_names(&decoded_name(left), &decoded_name(right))
+impl Ord for NpmName {
+  fn cmp(&self, other: &Self) -> Ordering {
+    compare_names(&self.0, &other.0)
+  }
+}
+
+impl PartialOrd for NpmName {
+  fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
 }
 
 /// Compares two names the way npm does, so that formatting doesn't undo npm's own sorting.

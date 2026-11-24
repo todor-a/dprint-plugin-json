@@ -249,7 +249,7 @@ impl Validator<'_> {
         None => return Err(self.eof()),
       }
       self.value()?;
-      // comma or close
+      // comma, close or the next property when the comma is missing
       self.skip_comments();
       match self.toks.get(self.i) {
         Some(c) if c.kind == Kind::Comma => self.i += 1,
@@ -257,7 +257,7 @@ impl Validator<'_> {
           self.i += 1;
           return Ok(());
         }
-        Some(c) => return Err(self.unexpected(c)),
+        Some(_) => {}
         None => return Err(self.eof()),
       }
     }
@@ -275,6 +275,7 @@ impl Validator<'_> {
         return Ok(());
       }
       self.value()?;
+      // comma, close or the next element when the comma is missing
       self.skip_comments();
       match self.toks.get(self.i) {
         Some(c) if c.kind == Kind::Comma => self.i += 1,
@@ -282,7 +283,7 @@ impl Validator<'_> {
           self.i += 1;
           return Ok(());
         }
-        Some(c) => return Err(self.unexpected(c)),
+        Some(_) => {}
         None => return Err(self.eof()),
       }
     }

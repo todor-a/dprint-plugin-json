@@ -1,6 +1,8 @@
 use super::super::configuration::Configuration;
+use super::context::BumpVec;
 use super::context::Context;
 use super::token_finder::TokenFinder;
+use dprint_core::formatting::bumpalo::collections::CollectIn;
 use dprint_core::formatting::conditions::if_true_or;
 use dprint_core::formatting::ir_helpers::SingleLineOptions;
 use dprint_core::formatting::*;
@@ -8,24 +10,26 @@ use dprint_core_macros::sc;
 use jsonc_parser::ast::*;
 use jsonc_parser::common::Range;
 use jsonc_parser::common::Ranged;
-use jsonc_parser::tokens::TokenAndRange;
+use std::borrow::Cow;
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::fmt::Write;
 use text_lines::TextLines;
 
 use crate::configuration::*;
 
-pub fn generate(
-  parse_result: jsonc_parser::ParseResult,
-  text: &str,
+pub fn generate<'a>(
+  arena: &'a Arena,
+  parse_result: &'a jsonc_parser::ParseResult<'a>,
+  text: &'a str,
   config: &Configuration,
   is_jsonc: bool,
-) -> PrintItems {
-  let comments = parse_result.comments.unwrap();
-  let tokens = parse_result.tokens.unwrap();
-  let node_value = parse_result.value;
+) -> PrintItems<'a> {
+  let comments = parse_result.comments.as_ref().unwrap();
+  let tokens = parse_result.tokens.as_ref().unwrap();
+  let node_value = &parse_result.value;
   let text_info = TextLines::new(text);
   let mut context = Context {
+    arena,
     config,
     text,
     text_info,
@@ -33,35 +37,48 @@ pub fn generate(
     handled_comments: HashSet::new(),
     parent_stack: Vec::new(),
     current_node: None,
-    comments: &comments,
-    token_finder: TokenFinder::new(&tokens),
+    comments,
+    token_finder: TokenFinder::new(tokens),
   };
 
-  let mut items = PrintItems::new();
-  if let Some(node_value) = &node_value {
+  let mut items = PrintItems::new(arena);
+  if let Some(node_value) = node_value {
     items.extend(gen_node(node_value.into(), &mut context));
     items.extend(gen_trailing_comments_as_statements(node_value, &mut context));
   } else if let Some(comments) = comments.get(&0) {
     items.extend(gen_comments_as_statements(comments.iter(), None, &mut context));
   }
-  items.push_condition(conditions::if_true(
-    "endOfFileNewLine",
-    Rc::new(|context| Some(context.writer_info.column_number > 0 || context.writer_info.line_number > 0)),
-    Signal::NewLine.into(),
-  ));
+  if should_end_with_new_line(text, config) {
+    items.push_condition(conditions::if_true(
+      "endOfFileNewLine",
+      arena
+        .alloc_resolver(|context| Some(context.writer_info.column_number > 0 || context.writer_info.line_number > 0)),
+      Signal::NewLine.into_print_items(arena),
+    ));
+  }
 
   items
 }
 
-fn gen_node<'a>(node: Node<'a, 'a>, context: &mut Context<'a, '_>) -> PrintItems {
+fn should_end_with_new_line(text: &str, config: &Configuration) -> bool {
+  match config.eof_new_line {
+    EofNewLineKind::Always => true,
+    EofNewLineKind::Never => false,
+    // look for a newline anywhere in the trailing whitespace so that ex. a space after it doesn't count
+    // against it, and include `\r` for files that use it on its own as the newline
+    EofNewLineKind::Maintain => text[text.trim_end().len()..].contains(['\n', '\r']),
+  }
+}
+
+fn gen_node<'a>(node: Node<'a, 'a>, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   gen_node_with_inner(node, context, |items, _| items)
 }
 
 fn gen_node_with_inner<'a>(
   node: Node<'a, 'a>,
   context: &mut Context<'a, '_>,
-  inner_gen: impl FnOnce(PrintItems, &mut Context<'a, '_>) -> PrintItems,
-) -> PrintItems {
+  inner_gen: impl FnOnce(PrintItems<'a>, &mut Context<'a, '_>) -> PrintItems<'a>,
+) -> PrintItems<'a> {
   // store info
   let past_current_node = context.current_node.replace(node);
   let parent_end = past_current_node.as_ref().map(|n| n.end());
@@ -73,18 +90,19 @@ fn gen_node_with_inner<'a>(
   }
 
   // generate item
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
 
   // get the leading comments
-  if let Some(comments) = context.comments.get(&node.start()) {
+  let leading_comments = context.comments.get(&node.start());
+  if let Some(comments) = leading_comments {
     items.extend(gen_comments_as_leading(&node, comments.iter(), context));
   }
 
   // generate the node
-  if has_ignore_comment(&node, context) {
+  if has_ignore_comment(leading_comments.map(|c| c.as_slice()), context) {
     items.push_force_current_line_indentation();
     items.extend(inner_gen(
-      ir_helpers::gen_from_raw_string(node.text(context.text)),
+      ir_helpers::gen_from_raw_string(context.arena, node.text(context.text)),
       context,
     ));
   } else {
@@ -103,12 +121,16 @@ fn gen_node_with_inner<'a>(
   return items;
 
   #[inline]
-  fn gen_node_inner<'a>(node: &Node<'a, 'a>, context: &mut Context<'a, '_>) -> PrintItems {
+  fn gen_node_inner<'a>(node: &Node<'a, 'a>, context: &mut Context<'a, '_>) -> PrintItems<'a> {
     match node {
       Node::Array(node) => gen_array(node, context),
-      Node::BooleanLit(node) => node.value.to_string().into(),
-      Node::NullKeyword(_) => "null".into(),
-      Node::NumberLit(node) => node.value.to_string().into(),
+      Node::BooleanLit(node) => sc_items(context.arena, if node.value { sc!("true") } else { sc!("false") }),
+      Node::NullKeyword(_) => sc_items(context.arena, sc!("null")),
+      Node::NumberLit(node) => {
+        let mut items = PrintItems::new(context.arena);
+        items.push_str_runtime_width_computed(node.value);
+        items
+      }
       Node::Object(node) => gen_object(node, context),
       Node::ObjectProp(node) => gen_object_prop(node, context),
       Node::StringLit(node) => gen_string_lit(node, context),
@@ -117,7 +139,7 @@ fn gen_node_with_inner<'a>(
   }
 }
 
-fn gen_array<'a>(node: &'a Array<'a>, context: &mut Context<'a, '_>) -> PrintItems {
+fn gen_array<'a>(node: &'a Array<'a>, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   let force_multi_lines = !context.config.array_prefer_single_line
     && (should_break_up_single_line(node, context)
       || context.text_info.line_index(node.start())
@@ -129,10 +151,10 @@ fn gen_array<'a>(node: &'a Array<'a>, context: &mut Context<'a, '_>) -> PrintIte
 
   gen_surrounded_by_tokens(
     |context| {
-      let mut items = PrintItems::new();
+      let mut items = PrintItems::new(context.arena);
       items.extend(gen_comma_separated_values(
         GenCommaSeparatedValuesOptions {
-          nodes: node.elements.iter().map(|x| Some(x.into())).collect(),
+          nodes: node.elements.iter().map(Node::from),
           prefer_hanging: false,
           force_use_new_lines: force_multi_lines,
           allow_blank_lines: true,
@@ -157,7 +179,7 @@ fn gen_array<'a>(node: &'a Array<'a>, context: &mut Context<'a, '_>) -> PrintIte
   )
 }
 
-fn gen_object<'a>(obj: &'a Object, context: &mut Context<'a, '_>) -> PrintItems {
+fn gen_object<'a>(obj: &'a Object, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   let force_multi_lines = !context.config.object_prefer_single_line
     && (should_break_up_single_line(obj, context)
       || context.text_info.line_index(obj.start())
@@ -169,10 +191,10 @@ fn gen_object<'a>(obj: &'a Object, context: &mut Context<'a, '_>) -> PrintItems 
 
   gen_surrounded_by_tokens(
     |context| {
-      let mut items = PrintItems::new();
+      let mut items = PrintItems::new(context.arena);
       items.extend(gen_comma_separated_values(
         GenCommaSeparatedValuesOptions {
-          nodes: obj.properties.iter().map(|x| Some(Node::ObjectProp(x))).collect(),
+          nodes: obj.properties.iter().map(Node::ObjectProp),
           prefer_hanging: false,
           force_use_new_lines: force_multi_lines,
           allow_blank_lines: true,
@@ -197,8 +219,8 @@ fn gen_object<'a>(obj: &'a Object, context: &mut Context<'a, '_>) -> PrintItems 
   )
 }
 
-fn gen_object_prop<'a>(node: &'a ObjectProp, context: &mut Context<'a, '_>) -> PrintItems {
-  let mut items = PrintItems::new();
+fn gen_object_prop<'a>(node: &'a ObjectProp, context: &mut Context<'a, '_>) -> PrintItems<'a> {
+  let mut items = PrintItems::new(context.arena);
   items.extend(gen_node((&node.name).into(), context));
   items.push_sc(sc!(":"));
 
@@ -221,18 +243,22 @@ fn gen_object_prop<'a>(node: &'a ObjectProp, context: &mut Context<'a, '_>) -> P
 // silently dropped. Emit them as statements. `keys` are the comment-map slots to check (jsonc-parser
 // keys each group by both surrounding token ends); comments on the same line as `keys[0]` are left
 // to the regular handling.
-fn gen_dangling_comments<'a: 'b, 'b>(keys: &[usize], context: &mut Context<'a, 'b>) -> PrintItems {
-  let mut items = PrintItems::new();
+fn gen_dangling_comments<'a: 'b, 'b>(keys: &[usize], context: &mut Context<'a, 'b>) -> PrintItems<'a> {
+  let mut items = PrintItems::new(context.arena);
   let Some(&after) = keys.first() else {
     return items;
   };
+  // this runs for every property and element, so avoid computing the line when there's nothing to check
+  if !keys.iter().any(|key| context.comments.contains_key(key)) {
+    return items;
+  }
   let after_line = context.text_info.line_index(after);
-  let mut dangling: Vec<&'b Comment<'a>> = keys
+  let mut dangling: BumpVec<&'b Comment<'a>> = keys
     .iter()
     .filter_map(|key| context.comments.get(key))
     .flat_map(|group| group.iter())
     .filter(|c| !context.has_handled_comment(c) && context.text_info.line_index(c.start()) > after_line)
-    .collect();
+    .collect_in(context.arena.bump());
   dangling.sort_by_key(|c| c.start());
   // jsonc-parser stores the same comment group under both surrounding token ends, so a comment can
   // appear under two of `keys`; drop the duplicates so it isn't emitted (with its newline) twice.
@@ -255,88 +281,93 @@ fn gen_dangling_comments<'a: 'b, 'b>(keys: &[usize], context: &mut Context<'a, '
 }
 
 const DOUBLE_QUOTE_SC: &StringContainer = sc!("\"");
+const COMMA_SC: &StringContainer = sc!(",");
 
-fn gen_string_lit<'a>(node: &'a StringLit, context: &mut Context<'a, '_>) -> PrintItems {
+fn gen_string_lit<'a>(node: &'a StringLit, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   let text = node.text(context.text);
-  let is_double_quotes = text.starts_with('"');
-  let mut items = PrintItems::new();
-  let text = &text[1..text.len() - 1];
+  let is_single_quoted = text.starts_with('\'');
+  let mut items = PrintItems::new(context.arena);
   items.push_sc(DOUBLE_QUOTE_SC);
-  if is_double_quotes {
-    items.push_string(text.to_string());
-  } else {
-    let text = text.replace("\\'", "'");
-    items.push_string(text.replace('"', "\\\""));
-  }
+  items.push_str_runtime_width_computed(
+    context.alloc_cow_str(to_double_quoted_text(&text[1..text.len() - 1], is_single_quoted)),
+  );
   items.push_sc(DOUBLE_QUOTE_SC);
   items
 }
 
-fn gen_word_lit<'a>(node: &'a WordLit<'a>, _: &mut Context<'a, '_>) -> PrintItems {
+fn gen_word_lit<'a>(node: &'a WordLit<'a>, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   // this will be a property name that's not a string literal
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
   items.push_sc(DOUBLE_QUOTE_SC);
-  items.push_string(node.value.to_string());
+  items.push_str_runtime_width_computed(node.value);
   items.push_sc(DOUBLE_QUOTE_SC);
   items
 }
 
-struct GenCommaSeparatedValuesOptions<'a> {
-  nodes: Vec<Option<Node<'a, 'a>>>,
+struct GenCommaSeparatedValuesOptions<'a, TNodes> {
+  nodes: TNodes,
   prefer_hanging: bool,
   force_use_new_lines: bool,
   allow_blank_lines: bool,
   single_line_space_at_start: bool,
   single_line_space_at_end: bool,
-  custom_single_line_separator: Option<PrintItems>,
-  multi_line_options: ir_helpers::MultiLineOptions,
+  custom_single_line_separator: Option<PrintItems<'a>>,
+  multi_line_options: ir_helpers::MultiLineOptions<'a>,
   force_possible_newline_at_start: bool,
 }
 
 fn gen_comma_separated_values<'a>(
-  opts: GenCommaSeparatedValuesOptions<'a>,
+  opts: GenCommaSeparatedValuesOptions<'a, impl ExactSizeIterator<Item = Node<'a, 'a>>>,
   context: &mut Context<'a, '_>,
-) -> PrintItems {
+) -> PrintItems<'a> {
+  let arena = context.arena;
   let nodes = opts.nodes;
   let indent_width = context.config.indent_width;
   let compute_lines_span = opts.allow_blank_lines && opts.force_use_new_lines; // save time otherwise
   ir_helpers::gen_separated_values(
     |is_multi_line_or_hanging_ref| {
-      let mut generated_nodes = Vec::new();
       let nodes_count = nodes.len();
-      for (i, value) in nodes.into_iter().enumerate() {
-        let (allow_inline_multi_line, allow_inline_single_line) = if let Some(value) = &value {
-          (value.kind() == NodeKind::Object, false)
-        } else {
-          (false, false)
-        };
+      let mut generated_nodes = BumpVec::with_capacity_in(nodes_count, arena.bump());
+      for (i, value) in nodes.enumerate() {
+        let allow_inline_multi_line = value.kind() == NodeKind::Object;
         let lines_span = if compute_lines_span {
-          value.as_ref().map(|x| ir_helpers::LinesSpan {
-            start_line: context.start_line_with_comments(x),
-            end_line: context.end_line_with_comments(x),
+          Some(ir_helpers::LinesSpan {
+            start_line: context.start_line_with_comments(&value),
+            end_line: context.end_line_with_comments(&value),
           })
         } else {
           None
         };
         let items = ir_helpers::new_line_group({
           let is_final_node = i == nodes_count - 1;
-          let use_comma_for_last = !is_final_node
-            || match context.config.trailing_commas {
+          let use_comma_for_last = !is_final_node || {
+            let leading_comments = context.comments.get(&value.start()).map(|c| c.as_slice());
+            let trailing_commas = if has_ignore_comment(leading_comments, context) {
+              // an ignore comment also applies to the node's trailing comma
+              TrailingCommaKind::Maintain
+            } else {
+              context.config.trailing_commas
+            };
+            match trailing_commas {
               TrailingCommaKind::Always => true,
-              TrailingCommaKind::Maintain => match &value {
-                Some(value) => context.token_finder.get_next_token_if_comma(&value.range()).is_some(),
-                None => false,
-              },
+              TrailingCommaKind::Maintain => context.token_finder.get_next_token_if_comma(&value).is_some(),
               TrailingCommaKind::Jsonc => context.is_jsonc,
               TrailingCommaKind::Never => false,
-            };
+            }
+          };
           let maybe_comma = if !is_final_node {
-            ",".into()
+            sc_items(arena, COMMA_SC)
           } else if use_comma_for_last {
-            let is_multi_line = is_multi_line_or_hanging_ref.create_resolver();
-            if_true_or("is_multi_line", is_multi_line, ",".into(), PrintItems::new()).into()
+            let is_multi_line = is_multi_line_or_hanging_ref.create_resolver(arena);
+            if_true_or(
+              "is_multi_line",
+              is_multi_line,
+              sc_items(arena, COMMA_SC),
+              PrintItems::new(arena),
+            )
+            .into_print_items(arena)
           } else {
-            PrintItems::new()
+            PrintItems::new(arena)
           };
           gen_comma_separated_value(value, maybe_comma, context)
         });
@@ -344,7 +375,7 @@ fn gen_comma_separated_values<'a>(
           items,
           lines_span,
           allow_inline_multi_line,
-          allow_inline_single_line,
+          allow_inline_single_line: false,
           is_known_multi_line: false,
         });
       }
@@ -354,13 +385,13 @@ fn gen_comma_separated_values<'a>(
     ir_helpers::GenSeparatedValuesOptions {
       prefer_hanging: opts.prefer_hanging,
       force_use_new_lines: opts.force_use_new_lines,
-      allow_blank_lines: opts.allow_blank_lines,
+      max_blank_lines: u32::from(opts.allow_blank_lines),
       single_line_options: SingleLineOptions {
         space_at_start: opts.single_line_space_at_start,
         space_at_end: opts.single_line_space_at_end,
         separator: opts
           .custom_single_line_separator
-          .unwrap_or_else(|| Signal::SpaceOrNewLine.into()),
+          .unwrap_or_else(|| Signal::SpaceOrNewLine.into_print_items(arena)),
       },
       indent_width,
       multi_line_options: opts.multi_line_options,
@@ -371,60 +402,48 @@ fn gen_comma_separated_values<'a>(
 }
 
 fn gen_comma_separated_value<'a>(
-  value: Option<Node<'a, 'a>>,
-  generated_comma: PrintItems,
+  element: Node<'a, 'a>,
+  generated_comma: PrintItems<'a>,
   context: &mut Context<'a, '_>,
-) -> PrintItems {
-  let mut items = PrintItems::new();
-  let comma_token = get_comma_token(&value, context);
+) -> PrintItems<'a> {
+  let mut items = PrintItems::new(context.arena);
+  let comma_token = context.token_finder.get_next_token_if_comma(&element);
 
-  if let Some(element) = value {
-    let generated_comma = generated_comma.into_rc_path();
-    let element_end = element.end();
-    let has_comma = comma_token.is_some();
-    items.extend(gen_node_with_inner(element, context, move |mut items, context| {
-      // Own-line comments between the element and its trailing comma would be dropped, so emit them
-      // here. Only when a comma follows; otherwise they're the closing token's leading comments.
-      if has_comma {
-        items.extend(gen_dangling_comments(&[element_end], context));
-      }
-      // this Rc clone is necessary because we can't move the captured generated_comma out of this closure
-      items.push_optional_path(generated_comma);
-      items
-    }));
-  } else {
-    items.extend(generated_comma);
-  }
+  let generated_comma = generated_comma.into_rc_path();
+  let element_end = element.end();
+  let has_comma = comma_token.is_some();
+  items.extend(gen_node_with_inner(element, context, move |mut items, context| {
+    // Own-line comments between the element and its trailing comma would be dropped, so emit them
+    // here. Only when a comma follows; otherwise they're the closing token's leading comments.
+    if has_comma {
+      items.extend(gen_dangling_comments(&[element_end], context));
+    }
+    // this Rc clone is necessary because we can't move the captured generated_comma out of this closure
+    items.push_optional_path(generated_comma);
+    items
+  }));
 
   // get the trailing comments after the comma token
   if let Some(comma_token) = comma_token {
     items.extend(gen_trailing_comments(comma_token, context));
   }
 
-  return items;
-
-  fn get_comma_token<'a, 'b>(element: &Option<Node>, context: &mut Context<'a, 'b>) -> Option<&'b TokenAndRange<'a>> {
-    if let Some(element) = element {
-      context.token_finder.get_next_token_if_comma(element)
-    } else {
-      None
-    }
-  }
+  items
 }
 
 struct GenSurroundedByTokensOptions {
-  open_token: &'static StringContainer,
-  close_token: &'static StringContainer,
+  open_token: &'static StringContainer<'static>,
+  close_token: &'static StringContainer<'static>,
   range: Range,
   first_member: Option<Range>,
   prefer_single_line_when_empty: bool,
 }
 
 fn gen_surrounded_by_tokens<'a, 'b>(
-  gen_inner: impl FnOnce(&mut Context<'a, 'b>) -> PrintItems,
+  gen_inner: impl FnOnce(&mut Context<'a, 'b>) -> PrintItems<'a>,
   opts: GenSurroundedByTokensOptions,
   context: &mut Context<'a, 'b>,
-) -> PrintItems {
+) -> PrintItems<'a> {
   let open_token_end = opts.range.start + opts.open_token.text.len();
   let close_token_start = opts.range.end - opts.close_token.text.len();
 
@@ -435,7 +454,7 @@ fn gen_surrounded_by_tokens<'a, 'b>(
   context.assert_text(close_token_start, opts.range.end, opts.close_token.text);
 
   // generate
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
   let open_token_start_line = context.text_info.line_index(opts.range.start);
 
   items.push_sc(opts.open_token);
@@ -476,11 +495,11 @@ fn gen_surrounded_by_tokens<'a, 'b>(
     }
     items.push_condition(conditions::if_true(
       "newLineIfHasCommentsAndNotStartOfNewLine",
-      Rc::new(move |context| {
+      context.arena.alloc_resolver(move |context| {
         let had_comments = !condition_helpers::is_at_same_position(context, before_trailing_comments_lc)?;
         Some(had_comments && !context.writer_info.is_start_of_line())
       }),
-      Signal::NewLine.into(),
+      Signal::NewLine.into_print_items(context.arena),
     ));
   } else {
     let range_end_line = context.text_info.line_index(opts.range.end);
@@ -498,11 +517,12 @@ fn gen_surrounded_by_tokens<'a, 'b>(
       // generate the comments
       if has_unhandled_comment(comments.iter(), context) {
         if is_single_line {
+          let arena = context.arena;
           let indent_width = context.config.indent_width;
           items.extend(
             ir_helpers::gen_separated_values(
               |_| {
-                let mut generated_comments = Vec::new();
+                let mut generated_comments = BumpVec::with_capacity_in(comments.len(), arena.bump());
                 for c in comments.iter() {
                   let start_line = context.text_info.line_index(c.start());
                   let end_line = context.text_info.line_index(c.end());
@@ -521,11 +541,11 @@ fn gen_surrounded_by_tokens<'a, 'b>(
               ir_helpers::GenSeparatedValuesOptions {
                 prefer_hanging: false,
                 force_use_new_lines: !is_single_line,
-                allow_blank_lines: true,
+                max_blank_lines: 1,
                 single_line_options: ir_helpers::SingleLineOptions {
                   space_at_start: false,
                   space_at_end: false,
-                  separator: Signal::SpaceOrNewLine.into(),
+                  separator: Signal::SpaceOrNewLine.into_print_items(arena),
                 },
                 indent_width,
                 multi_line_options: ir_helpers::MultiLineOptions::surround_newlines_indented(),
@@ -556,9 +576,9 @@ fn gen_surrounded_by_tokens<'a, 'b>(
   fn gen_first_line_trailing_comment<'a: 'b, 'b>(
     open_token_start_line: usize,
     comments: impl Iterator<Item = &'b Comment<'a>>,
-    context: &mut Context,
-  ) -> PrintItems {
-    let mut items = PrintItems::new();
+    context: &mut Context<'a, '_>,
+  ) -> PrintItems<'a> {
+    let mut items = PrintItems::new(context.arena);
     let mut comments = comments;
     if let Some(first_comment) = comments.next()
       && first_comment.kind() == CommentKind::Line
@@ -583,15 +603,15 @@ fn has_unhandled_comment<'a: 'b, 'b>(
   comments.any(|c| !context.has_handled_comment(c))
 }
 
-fn gen_trailing_comments(node: &dyn Ranged, context: &mut Context) -> PrintItems {
+fn gen_trailing_comments<'a>(node: &dyn Ranged, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   if let Some(trailing_comments) = context.comments.get(&node.end()) {
     gen_comments_as_trailing(node, trailing_comments.iter(), context)
   } else {
-    PrintItems::new()
+    PrintItems::new(context.arena)
   }
 }
 
-fn gen_trailing_comments_as_statements(node: &dyn Ranged, context: &mut Context) -> PrintItems {
+fn gen_trailing_comments_as_statements<'a>(node: &dyn Ranged, context: &mut Context<'a, '_>) -> PrintItems<'a> {
   let unhandled_comments = get_trailing_comments_as_statements(node, context);
   gen_comments_as_statements(unhandled_comments.into_iter(), Some(node), context)
 }
@@ -599,14 +619,15 @@ fn gen_trailing_comments_as_statements(node: &dyn Ranged, context: &mut Context)
 fn get_trailing_comments_as_statements<'a, 'b>(
   node: &dyn Ranged,
   context: &mut Context<'a, 'b>,
-) -> Vec<&'b Comment<'a>> {
-  let mut comments = Vec::new();
+) -> BumpVec<'b, &'b Comment<'a>> {
+  let Some(trailing_comments) = context.comments.get(&node.end()) else {
+    return BumpVec::new_in(context.arena.bump());
+  };
+  let mut comments = BumpVec::with_capacity_in(trailing_comments.len(), context.arena.bump());
   let node_end_line = context.text_info.line_index(node.end());
-  if let Some(trailing_comments) = context.comments.get(&node.end()) {
-    for comment in trailing_comments.iter() {
-      if !context.has_handled_comment(comment) && node_end_line < context.text_info.line_index(comment.end()) {
-        comments.push(comment);
-      }
+  for comment in trailing_comments.iter() {
+    if !context.has_handled_comment(comment) && node_end_line < context.text_info.line_index(comment.end()) {
+      comments.push(comment);
     }
   }
   comments
@@ -616,9 +637,9 @@ fn gen_comments_as_statements<'a: 'b, 'b>(
   comments: impl Iterator<Item = &'b Comment<'a>>,
   last_node: Option<&dyn Ranged>,
   context: &mut Context<'a, 'b>,
-) -> PrintItems {
+) -> PrintItems<'a> {
   let mut last_node = last_node;
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
   for comment in comments {
     if !context.has_handled_comment(comment) {
       items.extend(gen_comment_based_on_last_node(
@@ -638,10 +659,12 @@ fn gen_comments_as_statements<'a: 'b, 'b>(
 fn gen_comments_as_leading<'a: 'b, 'b>(
   node: &dyn Ranged,
   comments: impl Iterator<Item = &'b Comment<'a>>,
-  context: &mut Context,
-) -> PrintItems {
-  let mut items = PrintItems::new();
-  let comments = comments.filter(|c| !context.has_handled_comment(c)).collect::<Vec<_>>();
+  context: &mut Context<'a, '_>,
+) -> PrintItems<'a> {
+  let mut items = PrintItems::new(context.arena);
+  let comments = comments
+    .filter(|c| !context.has_handled_comment(c))
+    .collect_in::<BumpVec<_>>(context.arena.bump());
 
   if !comments.is_empty() {
     let last_comment = comments.last().unwrap();
@@ -667,18 +690,18 @@ fn gen_comments_as_leading<'a: 'b, 'b>(
 fn gen_comments_as_trailing<'a: 'b, 'b>(
   node: &dyn Ranged,
   comments: impl Iterator<Item = &'b Comment<'a>>,
-  context: &mut Context,
-) -> PrintItems {
+  context: &mut Context<'a, '_>,
+) -> PrintItems<'a> {
   // use the roslyn definition of trailing comments
   let node_end_line = context.text_info.line_index(node.end());
   let trailing_comments_on_same_line = comments
     .filter(|c| context.text_info.line_index(c.start()) <= node_end_line)
-    .collect::<Vec<_>>();
+    .collect_in::<BumpVec<_>>(context.arena.bump());
 
   let first_unhandled_comment = trailing_comments_on_same_line
     .iter()
     .find(|c| !context.has_handled_comment(c));
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
 
   if let Some(Comment::Block(_)) = first_unhandled_comment {
     items.push_space();
@@ -698,10 +721,10 @@ fn gen_comment_collection<'a: 'b, 'b>(
   comments: impl Iterator<Item = &'b Comment<'a>>,
   last_node: Option<&dyn Ranged>,
   next_node: Option<&dyn Ranged>,
-  context: &mut Context,
-) -> PrintItems {
+  context: &mut Context<'a, '_>,
+) -> PrintItems<'a> {
   let mut last_node = last_node;
-  let mut items = PrintItems::new();
+  let mut items = PrintItems::new(context.arena);
   let next_node_start_line = next_node.map(|n| context.text_info.line_index(n.start()));
 
   for comment in comments {
@@ -729,13 +752,13 @@ struct GenCommentBasedOnLastNodeOptions {
   separate_with_newlines: bool,
 }
 
-fn gen_comment_based_on_last_node(
-  comment: &Comment,
+fn gen_comment_based_on_last_node<'a>(
+  comment: &Comment<'a>,
   last_node: &Option<&dyn Ranged>,
   opts: GenCommentBasedOnLastNodeOptions,
-  context: &mut Context,
-) -> PrintItems {
-  let mut items = PrintItems::new();
+  context: &mut Context<'a, '_>,
+) -> PrintItems<'a> {
+  let mut items = PrintItems::new(context.arena);
   let mut pushed_ignore_new_lines = false;
 
   if let Some(last_node) = last_node {
@@ -768,7 +791,7 @@ fn gen_comment_based_on_last_node(
   items
 }
 
-fn gen_comment(comment: &Comment, context: &mut Context) -> Option<PrintItems> {
+fn gen_comment<'a>(comment: &Comment<'a>, context: &mut Context<'a, '_>) -> Option<PrintItems<'a>> {
   // only generate if handled
   if context.has_handled_comment(comment) {
     return None;
@@ -777,15 +800,17 @@ fn gen_comment(comment: &Comment, context: &mut Context) -> Option<PrintItems> {
   // mark handled and generate
   context.mark_comment_handled(comment);
   Some(match comment {
-    Comment::Block(comment) => ir_helpers::gen_js_like_comment_block(comment.text),
-    Comment::Line(comment) => {
-      ir_helpers::gen_js_like_comment_line(comment.text, context.config.comment_line_force_space_after_slashes)
-    }
+    Comment::Block(comment) => ir_helpers::gen_js_like_comment_block(context.arena, comment.text),
+    Comment::Line(comment) => ir_helpers::gen_js_like_comment_line(
+      context.arena,
+      comment.text,
+      context.config.comment_line_force_space_after_slashes,
+    ),
   })
 }
 
-fn has_ignore_comment(node: &dyn Ranged, context: &Context) -> bool {
-  if let Some(last_comment) = context.comments.get(&(node.start())).and_then(|c| c.last()) {
+fn has_ignore_comment(leading_comments: Option<&[Comment]>, context: &Context) -> bool {
+  if let Some(last_comment) = leading_comments.and_then(|c| c.last()) {
     ir_helpers::text_has_dprint_ignore(last_comment.text(), &context.config.ignore_node_comment_text)
   } else {
     false
@@ -803,4 +828,61 @@ fn should_break_up_single_line(ranged: &impl Ranged, context: &Context) -> bool 
   // any false positives (unless someone is being silly).
   context.text_info.line_index(range.start) == context.text_info.line_index(range.end)
     && range.width() > (context.config.line_width * 2) as usize
+}
+
+/// Gets the text between a string's quotes for writing it in double quotes with the same value.
+///
+/// Control characters (U+0000 through U+001F), which JSON doesn't allow unescaped in strings,
+/// get escaped since the parser accepts them and the printer can't handle raw newlines. That
+/// includes a control character escaped the JSON5 way (ex. a backslash then a tab), and a JSON5
+/// line continuation (a backslash then a newline) is removed since it means nothing.
+fn to_double_quoted_text(text: &str, is_single_quoted: bool) -> Cow<'_, str> {
+  // checking bytes is enough since every byte of a multi-byte utf-8 char is at least 0x80
+  let needs_change = |b: u8| b < 0x20 || is_single_quoted && matches!(b, b'"' | b'\'');
+  if !text.bytes().any(needs_change) {
+    return Cow::Borrowed(text);
+  }
+
+  let mut result = String::with_capacity(text.len() + 8);
+  let mut chars = text.chars();
+  while let Some(c) = chars.next() {
+    match c {
+      '\\' => match chars.next() {
+        Some('\n') => {}
+        Some('\r') => {
+          if chars.clone().next() == Some('\n') {
+            chars.next();
+          }
+        }
+        Some(c @ '\u{00}'..='\u{1F}') => push_escaped_control_char(&mut result, c),
+        Some('\'') if is_single_quoted => result.push('\''),
+        Some(c) => {
+          result.push('\\');
+          result.push(c);
+        }
+        None => result.push('\\'),
+      },
+      '"' if is_single_quoted => result.push_str("\\\""),
+      '\u{00}'..='\u{1F}' => push_escaped_control_char(&mut result, c),
+      _ => result.push(c),
+    }
+  }
+  Cow::Owned(result)
+}
+
+fn push_escaped_control_char(result: &mut String, c: char) {
+  match c {
+    '\n' => result.push_str("\\n"),
+    '\r' => result.push_str("\\r"),
+    '\t' => result.push_str("\\t"),
+    '\u{08}' => result.push_str("\\b"),
+    '\u{0C}' => result.push_str("\\f"),
+    _ => write!(result, "\\u{:04x}", c as u32).unwrap(),
+  }
+}
+
+fn sc_items<'a>(arena: &'a Arena, sc: &'static StringContainer<'static>) -> PrintItems<'a> {
+  let mut items = PrintItems::new(arena);
+  items.push_sc(sc);
+  items
 }

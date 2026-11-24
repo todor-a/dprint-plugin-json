@@ -14,6 +14,8 @@ use dprint_core::plugins::SyncPluginHandler;
 
 use super::configuration::Configuration;
 use super::configuration::resolve_config;
+use super::format_range::format_text_range;
+use super::format_text::format_text;
 
 struct JsonPluginHandler;
 
@@ -30,6 +32,7 @@ impl SyncPluginHandler<Configuration> for JsonPluginHandler {
       file_matching: FileMatchingInfo {
         file_extensions: vec!["json".to_string(), "jsonc".to_string()],
         file_names: vec![],
+        additive: false,
       },
     }
   }
@@ -50,6 +53,7 @@ impl SyncPluginHandler<Configuration> for JsonPluginHandler {
         version
       ),
       update_url: Some("https://plugins.dprint.dev/dprint/dprint-plugin-json/latest.json".to_string()),
+      supports_range_formatting: Some(true),
     }
   }
 
@@ -63,9 +67,12 @@ impl SyncPluginHandler<Configuration> for JsonPluginHandler {
     _format_with_host: impl FnMut(SyncHostFormatRequest) -> FormatResult,
   ) -> FormatResult {
     let file_text = String::from_utf8(request.file_bytes)?;
-    super::format_text(request.file_path, &file_text, request.config)
-      .map(|maybe_text| maybe_text.map(|t| t.into_bytes()))
-      .map_err(FormatError::new)
+    match request.range {
+      Some(range) => format_text_range(request.file_path, &file_text, range, request.config),
+      None => format_text(request.file_path, &file_text, request.config),
+    }
+    .map(|maybe_text| maybe_text.map(|t| t.into_bytes()))
+    .map_err(FormatError::new)
   }
 }
 

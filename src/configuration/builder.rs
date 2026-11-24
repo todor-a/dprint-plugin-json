@@ -67,6 +67,13 @@ impl ConfigurationBuilder {
     self.insert("newLineKind", value.to_string().into())
   }
 
+  /// Whether to end the file with a newline.
+  ///
+  /// Default: `EofNewLineKind::Always`
+  pub fn eof_new_line(&mut self, value: EofNewLineKind) -> &mut Self {
+    self.insert("eofNewLine", value.to_string().into())
+  }
+
   /// The kind of newline to use.
   /// Default: true
   pub fn comment_line_force_space_after_slashes(&mut self, value: bool) -> &mut Self {
@@ -123,7 +130,9 @@ impl ConfigurationBuilder {
 
   /// When `trailingCommas` is `jsonc`, treat these files as JSONC and use trailing commas.
   ///
-  /// Ex. `vec!["tsconfig.json".to_string(), ".vscode/settings.json".to_string()]`
+  /// Supports globs (`*`, `?`, `**`, `[...]`, and `{a,b}`) matched against the end of the file path.
+  ///
+  /// Ex. `vec!["{j,t}sconfig*.json".to_string(), ".vscode/*.json".to_string()]`
   pub fn json_trailing_comma_files(&mut self, value: Vec<String>) -> &mut Self {
     self.insert(
       "jsonTrailingCommaFiles",
@@ -167,6 +176,7 @@ mod tests {
       .use_tabs(true)
       .indent_width(4)
       .new_line_kind(NewLineKind::CarriageReturnLineFeed)
+      .eof_new_line(EofNewLineKind::Maintain)
       .comment_line_force_space_after_slashes(false)
       .prefer_single_line(true)
       .array_prefer_single_line(true)
@@ -178,7 +188,7 @@ mod tests {
       .ignore_node_comment_text("deno-fmt-ignore");
 
     let inner_config = config.get_inner_config();
-    assert_eq!(inner_config.len(), 13);
+    assert_eq!(inner_config.len(), 14);
     let diagnostics = resolve_config(inner_config, &GlobalConfiguration::default()).diagnostics;
     assert_eq!(diagnostics.len(), 0);
   }

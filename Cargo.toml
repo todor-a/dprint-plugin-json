@@ -1,6 +1,6 @@
 [package]
 name = "dprint-plugin-json"
-version = "0.23.0"
+version = "0.26.0"
 authors = ["David Sherret <dsherret@gmail.com>"]
 edition = "2024"
 homepage = "https://github.com/dprint/dprint-plugin-json"
@@ -27,10 +27,10 @@ wasm = ["serde_json", "dprint-core/wasm"]
 tracing = ["dprint-core/tracing", "dep:text_lines", "dep:dprint-core-macros"]
 
 [dependencies]
-dprint-core = { version = "0.69.1", features = ["formatting"] }
+dprint-core = { version = "0.75.2", features = ["formatting"] }
 dprint-core-macros = { version = "0.1.0", optional = true }
-# used by the package.json conventions (cst) and the tracing generator
-jsonc-parser = { version = "0.33.2", features = ["cst", "error_unicode_width"] }
+# used by the package.json conventions (cst), range formatting and the tracing generator
+jsonc-parser = { version = "0.34.0", features = ["cst", "error_unicode_width"] }
 serde = { version = "1.0.144", features = ["derive"] }
 serde_json = { version = "1.0", optional = true }
 text_lines = { version = "0.6.0", optional = true }
@@ -38,7 +38,6 @@ thiserror = "2"
 unicode-width = "0.2.0"
 
 [dev-dependencies]
-anyhow = "1.0.64"
 debug-here = "0.2"
-dprint-development = "0.10.2"
+dprint-development = "0.12.1"
 serde_json = { version = "1.0" }

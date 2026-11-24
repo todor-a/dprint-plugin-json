@@ -1,36 +1,22 @@
 #!/usr/bin/env -S deno run -A
-import { conditions, defineMatrix, expr, job, step, workflow } from "jsr:@david/gagen@^0.5.0";
+import { conditions, job, step, workflow } from "jsr:@david/gagen@^0.5.0";
 
 const pluginName = "json";
 const cargoWasmName = `dprint_plugin_${pluginName}`;
 
-const matrix = defineMatrix({
-  config: [
-    { os: "ubuntu-latest", kind: "test_release" },
-    { os: "ubuntu-latest", kind: "test_debug" },
-  ],
-});
-
-const kind = expr("matrix.config.kind");
-const os = expr("matrix.config.os");
-
-const isRelease = kind.equals("test_release");
-const isDebug = kind.equals("test_debug");
 const isTag = conditions.isTag();
-const isReleaseAndTag = isRelease.and(isTag);
 
 const getTagVersion = step({
   id: "get_tag_version",
   name: "Get tag version",
-  if: isReleaseAndTag,
+  if: isTag,
   run: `echo "TAG_VERSION=\${GITHUB_REF/refs\\/tags\\//}" >> "$GITHUB_OUTPUT"`,
   outputs: ["TAG_VERSION"],
 });
 
 const buildJob = job("build", {
-  name: `${kind} ${os}`,
-  runsOn: os,
-  strategy: { matrix },
+  name: "build",
+  runsOn: "ubuntu-latest",
   env: {
     CARGO_INCREMENTAL: 0,
     RUST_BACKTRACE: "full",
@@ -40,37 +26,40 @@ const buildJob = job("build", {
     { uses: "dsherret/rust-toolchain-file@v1" },
     {
       name: "Install wasm32 target",
-      if: isRelease,
       run: "rustup target add wasm32-unknown-unknown",
     },
     {
       uses: "Swatinem/rust-cache@v2",
       with: { "save-if": "${{ github.ref == 'refs/heads/main' }}" },
     },
-    // deno is needed by the "Lint workflow generation" step (test_debug)
-    // and by the "Pre-release" step (test_release on tag). Install it
-    // once at the top of every job to keep the matrix steps simple.
+    // deno is needed by the "Generate config schema" and "Lint workflow
+    // generation" steps and, on a tag, by the "Pre-release" step
     {
       uses: "denoland/setup-deno@v2",
       with: { "deno-version": "v2.x" },
     },
 
-    { name: "Build debug", if: isDebug, run: "cargo build" },
     {
       name: "Build release",
-      if: isRelease,
       run: "cargo build --target wasm32-unknown-unknown --features wasm --release",
     },
+    // adds the outputs of the code examples to the config schema, which also
+    // checks that the plugin accepts every property in it
+    {
+      name: "Generate config schema",
+      run: [
+        "deno run -A --minimum-dependency-age=0 jsr:@dprint/automation@0.14.3/tasks/publish-schema",
+        `target/wasm32-unknown-unknown/release/${cargoWasmName}.wasm deployment/schema.json --extension ${pluginName}`,
+      ].join(" "),
+    },
 
-    { name: "Test debug", if: isDebug, run: "cargo test" },
-    { name: "Test release", if: isRelease, run: "cargo test --release" },
+    { name: "Test", run: "cargo test" },
 
     getTagVersion,
 
     // NPM
     {
       uses: "actions/setup-node@v6",
-      if: isRelease,
       with: {
         "node-version": "24.x",
         "registry-url": "https://registry.npmjs.org",
@@ -78,7 +67,6 @@ const buildJob = job("build", {
     },
     {
       name: "Setup and test npm deployment",
-      if: isRelease,
       run: [
         "cd deployment/npm",
         "npm install",
@@ -90,7 +78,7 @@ const buildJob = job("build", {
     // GITHUB RELEASE
     {
       name: "Pre-release",
-      if: isReleaseAndTag,
+      if: isTag,
       run: [
         "# update config schema to have version",
         `sed -i 's/${pluginName}\\/0.0.0/${pluginName}\\/${getTagVersion.outputs.TAG_VERSION}/' deployment/schema.json`,
@@ -102,22 +90,18 @@ const buildJob = job("build", {
     },
     {
       name: "Release",
-      // pinned because softprops/action-gh-release was once compromised
-      uses: "softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844",
-      if: isReleaseAndTag,
-      env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
-      with: {
-        files: [
-          "target/wasm32-unknown-unknown/release/plugin.wasm",
-          "deployment/schema.json",
-        ].join("\n"),
-        body_path: "${{ github.workspace }}-CHANGELOG.txt",
-        draft: false,
-      },
+      if: isTag,
+      // gh uploads the assets to a draft and then publishes it, which immutable releases require
+      env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" },
+      run: [
+        `gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME"`,
+        "--notes-file ${{ github.workspace }}-CHANGELOG.txt",
+        "target/wasm32-unknown-unknown/release/plugin.wasm",
+        "deployment/schema.json",
+      ].join(" \\\n  "),
     },
     {
       name: "Lint workflow generation",
-      if: isDebug,
       run: [
         "./.github/workflows/ci.ts --lint",
         "./.github/workflows/publish.ts --lint",

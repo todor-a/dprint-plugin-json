@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use super::configuration::Configuration;
+use super::configuration::TrailingCommaKind;
+use super::glob;
 use super::package_json;
 use crate::streaming::StreamError;
 use crate::streaming::format_streaming;
@@ -31,18 +33,29 @@ impl FormatError {
 }
 
 pub fn format_text(path: &Path, text: &str, config: &Configuration) -> Result<Option<String>, FormatError> {
-  let result = format_text_inner(path, text, config)?;
+  let result = format_text_inner(path, text, config, None)?;
   if result == text { Ok(None) } else { Ok(Some(result)) }
 }
 
-fn format_text_inner(path: &Path, text: &str, config: &Configuration) -> Result<String, FormatError> {
+/// Formats a file, only applying the `package.json` conventions to the sections that are the
+/// values of the top level properties at the provided indexes when given any.
+pub(crate) fn format_text_inner(
+  path: &Path,
+  text: &str,
+  config: &Configuration,
+  package_json_sections: Option<&[usize]>,
+) -> Result<String, FormatError> {
   let text = strip_bom(text);
   let text = if config.package_json_apply_conventions && package_json::is_package_json_file(path) {
-    package_json::apply_conventions(text, config)
+    match package_json_sections {
+      Some(sections) => package_json::apply_conventions_to_sections(text, config, sections),
+      None => package_json::apply_conventions(text, config),
+    }
   } else {
     Cow::Borrowed(text)
   };
-  let is_jsonc = is_jsonc_file(path, config);
+  // only used for jsonc trailing commas, so avoid matching the path otherwise
+  let is_jsonc = config.trailing_commas == TrailingCommaKind::Jsonc && is_jsonc_file(path, config);
   match format_streaming(text.as_bytes(), config, is_jsonc) {
     // Input is valid UTF-8 (`&str`) and the formatter only rearranges/copies its
     // bytes, so the output is always valid UTF-8.
@@ -61,6 +74,7 @@ fn format_text_inner(path: &Path, text: &str, config: &Configuration) -> Result<
 #[cfg(feature = "tracing")]
 pub fn trace_file(text: &str, config: &Configuration) -> dprint_core::formatting::TracingResult {
   use dprint_core::configuration::resolve_new_line_kind;
+  use dprint_core::formatting::Arena;
   use dprint_core::formatting::PrintOptions;
   use jsonc_parser::CollectOptions;
   use jsonc_parser::CommentCollectionStrategy;
@@ -75,9 +89,10 @@ pub fn trace_file(text: &str, config: &Configuration) -> dprint_core::formatting
     &Default::default(),
   )
   .unwrap();
+  let arena = Arena::new();
 
   dprint_core::formatting::trace_printing(
-    || crate::generation::generate(parse_result, text, config, false),
+    crate::generation::generate(&arena, &parse_result, text, config, false),
     PrintOptions {
       indent_width: config.indent_width,
       max_width: config.line_width,
@@ -87,28 +102,25 @@ pub fn trace_file(text: &str, config: &Configuration) -> dprint_core::formatting
   )
 }
 
-fn strip_bom(text: &str) -> &str {
+pub(crate) fn strip_bom(text: &str) -> &str {
   text.strip_prefix("\u{FEFF}").unwrap_or(text)
 }
 
 fn is_jsonc_file(path: &Path, config: &Configuration) -> bool {
   fn has_jsonc_extension(path: &Path) -> bool {
-    if let Some(ext) = path.extension() {
-      return ext.to_string_lossy().to_ascii_lowercase() == "jsonc";
-    }
-
-    false
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jsonc"))
   }
 
   fn is_special_json_file(path: &Path, config: &Configuration) -> bool {
-    let path = path.to_string_lossy();
-    for file_name in &config.json_trailing_comma_files {
-      if path.ends_with(file_name) {
-        return true;
-      }
+    if config.json_trailing_comma_files.is_empty() {
+      return false;
     }
 
-    false
+    let path = path.to_string_lossy();
+    config
+      .json_trailing_comma_files
+      .iter()
+      .any(|pattern| glob::matches_path_end(pattern, &path))
   }
 
   has_jsonc_extension(path) || is_special_json_file(path, config)
@@ -119,6 +131,7 @@ mod tests {
   use std::path::PathBuf;
 
   use crate::configuration::ConfigurationBuilder;
+  use crate::configuration::EofNewLineKind;
   use crate::configuration::TrailingCommaKind;
 
   use super::super::configuration::resolve_config;
@@ -181,6 +194,21 @@ mod tests {
   }
 
   #[test]
+  fn test_is_jsonc_file_globs() {
+    let config = ConfigurationBuilder::new()
+      .json_trailing_comma_files(vec!["{j,t}sconfig*.json".to_string(), ".vscode/*.json".to_string()])
+      .build();
+    assert!(is_jsonc_file(&PathBuf::from("/tsconfig.json"), &config));
+    assert!(is_jsonc_file(&PathBuf::from("/a/jsconfig.json"), &config));
+    assert!(is_jsonc_file(&PathBuf::from("/a/tsconfig.lib.prod.json"), &config));
+    assert!(!is_jsonc_file(&PathBuf::from("/a/psconfig.json"), &config));
+    assert!(is_jsonc_file(&PathBuf::from("/a/.vscode/tasks.json"), &config));
+    assert!(!is_jsonc_file(&PathBuf::from("/a/.vscode/sub/tasks.json"), &config));
+    assert!(!is_jsonc_file(&PathBuf::from("/a/vscode/tasks.json"), &config));
+    assert!(is_jsonc_file(&PathBuf::from("C:\\a\\.vscode\\launch.json"), &config));
+  }
+
+  #[test]
   fn package_json_listed_as_a_trailing_comma_file() {
     // opting package.json into jsonc is the caller's business; the conventions still apply, and
     // the two compose into a reordered file with the trailing comma that was asked for
@@ -210,6 +238,34 @@ mod tests {
   }
 
   #[test]
+  fn eof_new_line_maintain_whitespace() {
+    // the spec files can't express these since they normalize newlines and editors trim trailing spaces
+    let config = ConfigurationBuilder::new()
+      .eof_new_line(EofNewLineKind::Maintain)
+      .new_line_kind(NewLineKind::Auto)
+      .build();
+    assert_eq!(format(&config, "{\"a\":1}\r\n"), "{ \"a\": 1 }\r\n");
+    assert_eq!(format(&config, "{\"a\":1}\r\n\r\n"), "{ \"a\": 1 }\r\n");
+    assert_eq!(format(&config, "{\"a\":1}  "), "{ \"a\": 1 }");
+    assert_eq!(format(&config, "{\"a\":1}\n  "), "{ \"a\": 1 }\n");
+    assert_eq!(format(&config, "\u{FEFF}{\"a\":1}"), "{ \"a\": 1 }");
+
+    let config = ConfigurationBuilder::new()
+      .eof_new_line(EofNewLineKind::Maintain)
+      .build();
+    assert_eq!(format(&config, "{\"a\":1}\r"), "{ \"a\": 1 }\n");
+  }
+
+  #[test]
+  fn eof_new_line_never_crlf() {
+    let config = ConfigurationBuilder::new()
+      .eof_new_line(EofNewLineKind::Never)
+      .new_line_kind(NewLineKind::Auto)
+      .build();
+    assert_eq!(format(&config, "{\r\n  \"a\": 1\r\n}\r\n"), "{\r\n  \"a\": 1\r\n}");
+  }
+
+  #[test]
   fn should_strip_bom() {
     for input_text in ["\u{FEFF}{}", "\u{FEFF}{ }"] {
       let global_config = GlobalConfiguration::default();
@@ -217,5 +273,48 @@ mod tests {
       let output_text = format_text(Path::new("."), input_text, &config).unwrap().unwrap();
       assert_eq!(output_text, "{}\n");
     }
+  }
+
+  #[test]
+  fn escapes_raw_control_chars_in_strings() {
+    // json doesn't allow these unescaped in strings (https://github.com/dprint/dprint-plugin-json/issues/63)
+    let config = ConfigurationBuilder::new().build();
+    assert_eq!(format(&config, "\"a\nb\""), "\"a\\nb\"\n");
+    assert_eq!(format(&config, "\"a\r\nb\""), "\"a\\r\\nb\"\n");
+    assert_eq!(format(&config, "\"a\tb\u{08}\u{0C}\""), "\"a\\tb\\b\\f\"\n");
+    assert_eq!(
+      format(&config, "\"a\u{00}\u{1B}\u{1F}\""),
+      "\"a\\u0000\\u001b\\u001f\"\n"
+    );
+    assert_eq!(format(&config, "'a\"\n\\'b'"), "\"a\\\"\\n'b\"\n");
+    // escape sequences and non-control characters are left alone
+    assert_eq!(format(&config, "\"a\\n\\\\\u{7F}\""), "\"a\\n\\\\\u{7F}\"\n");
+  }
+
+  #[test]
+  fn handles_json5_escapes_in_strings() {
+    // the spec files can't reliably express these since editors change raw line breaks and tabs
+    let config = ConfigurationBuilder::new().build();
+    // line continuations mean nothing
+    assert_eq!(format(&config, "\"a \\\nb\""), "\"a b\"\n");
+    assert_eq!(format(&config, "'a \\\r\nb \\\rc'"), "\"a b c\"\n");
+    // an escaped control character is that character
+    assert_eq!(format(&config, "\"a\\\tb\""), "\"a\\tb\"\n");
+    // an escaped backslash before a control character isn't an escape of it
+    assert_eq!(format(&config, "\"a\\\\\nb\""), "\"a\\\\\\nb\"\n");
+    // single quoted strings with escaped quotes
+    assert_eq!(format(&config, r#"'\"'"#), r#""\"""#.to_string() + "\n");
+    assert_eq!(format(&config, r#"'a\\\'b"c'"#), r#""a\\'b\"c""#.to_string() + "\n");
+    // other json5 escapes are left alone
+    assert_eq!(format(&config, r#""\x41\v\0""#), r#""\x41\v\0""#.to_string() + "\n");
+  }
+
+  fn format(config: &Configuration, text: &str) -> String {
+    let output = format_text(Path::new("/file.json"), text, config)
+      .unwrap()
+      .unwrap_or_else(|| text.to_string());
+    // ensure formatting is stable
+    assert_eq!(format_text(Path::new("/file.json"), &output, config).unwrap(), None);
+    output
   }
 }
